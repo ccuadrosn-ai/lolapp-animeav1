@@ -1,4 +1,4 @@
-# AnimeAV1
+# AnimeAV1 - CC
 Fuente general de anime para LolPlusTV (uso privado).
 
 ## Instalación (uso privado)

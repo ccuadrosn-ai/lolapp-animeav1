@@ -1,5 +1,5 @@
 /**
- * AnimeAV1 — addon general tipo "source" (LolPlusTV SDK API v1).
+ * AnimeAV1 - CC — addon general tipo "source" (LolPlusTV SDK API v1).
  * Flujo general para cualquier anime (series):
  *   TMDB id -> titulos (TMDB web es/en, sin API key)
  *   -> candidatos (buscador animeav1) -> confirmacion (aka/titulo de /media/{slug})
