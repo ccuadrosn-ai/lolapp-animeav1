@@ -3,7 +3,10 @@
  * Flujo general para cualquier anime (series):
  *   TMDB id -> titulos (TMDB web es/en, sin API key)
  *   -> candidatos (buscador animeav1) -> confirmacion (aka/titulo de /media/{slug})
- *   -> slug + episodio absoluto -> embeds DUB/SUB -> video directo.
+ *   -> slug + episodio absoluto -> embeds DUB/SUB.
+ *   getStreams devuelve embeds (listado rapido); extract() resuelve a video
+ *   directo fresco al dar play, con verificacion y un reintento, porque los
+ *   tokens caducan por peticion y los hosts a veces fallan.
  *
  * Limitaciones conocidas:
  * - Peliculas (type "movie"): no resueltas, retorna [].
@@ -232,21 +235,56 @@ async function resolveYourUpload(embedUrl) {
   return m[1];
 }
 
-/** extract(): embed -> video directo (falla -> embed original).
- * StreamTape/Voe/UPNShare se devuelven tal cual: el gate de StreamTape
- * responde 500 sistematico y los otros exigen JS de navegador. */
+/** extract(): embed -> video directo fresco al momento de reproducir.
+ * Los tokens de MP4Upload/YourUpload rotan por peticion y caducan rapido:
+ * resolver en getStreams (listado) deja URLs muertas al dar play. Por eso
+ * getStreams devuelve embeds y la resolucion final ocurre aqui, con
+ * verificacion Range y un reintento ante hosts lentos/caidos.
+ * StreamTape/Voe/UPNShare se devuelven tal cual (sin resolucion util). */
 async function extract(embedUrl) {
+  var u = String(embedUrl && embedUrl.url ? embedUrl.url : embedUrl);
+  var resolvable = u.indexOf("mp4upload.com") !== -1 || u.indexOf("yourupload.com") !== -1;
+  if (!resolvable) return { url: u, quality: "HD" };
+  for (var attempt = 0; attempt < 2; attempt++) {
+    try {
+      var direct = u.indexOf("mp4upload.com") !== -1
+        ? await resolveMp4Upload(u)
+        : await resolveYourUpload(u);
+      if (await verifyVideo(direct, u)) {
+        return { url: direct, quality: "HD", headers: { Referer: u, "User-Agent": UA } };
+      }
+    } catch (err) { /* reintentar una vez con token fresco */ }
+  }
   try {
-    var u = String(embedUrl && embedUrl.url ? embedUrl.url : embedUrl);
-    var direct = null;
-    if (u.indexOf("mp4upload.com") !== -1) direct = await resolveMp4Upload(u);
-    else if (u.indexOf("yourupload.com") !== -1) direct = await resolveYourUpload(u);
-    if (direct) {
-      return { url: direct, quality: "HD", headers: { Referer: u, "User-Agent": UA } };
-    }
-    return { url: u, quality: "HD" };
+    var last = u.indexOf("mp4upload.com") !== -1
+      ? await resolveMp4Upload(u)
+      : await resolveYourUpload(u);
+    return { url: last, quality: "HD", headers: { Referer: u, "User-Agent": UA } };
   } catch (err) {
-    return { url: String(embedUrl && embedUrl.url ? embedUrl.url : embedUrl), quality: "HD" };
+    return { url: u, quality: "HD" };
+  }
+}
+
+/** Verificacion barata: el directo responde video en el primer byte. */
+async function verifyVideo(url, referer) {
+  var ctrl = null;
+  var timer = null;
+  try {
+    if (typeof AbortController !== "undefined") {
+      ctrl = new AbortController();
+      timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, 8000);
+    }
+    var opts = { headers: { "User-Agent": UA, Range: "bytes=0-0", Referer: referer } };
+    if (ctrl) opts.signal = ctrl.signal;
+    var r = await fetch(url, opts);
+    if (timer) clearTimeout(timer);
+    if (r.status !== 206 && r.status !== 200) return false;
+    var ct = (r.headers.get("content-type") || "").toLowerCase();
+    try { if (r.body && r.body.cancel) await r.body.cancel(); } catch (e) {}
+    return ct.indexOf("video") !== -1 || ct.indexOf("octet-stream") !== -1;
+  } catch (err) {
+    if (timer) clearTimeout(timer);
+    return false;
   }
 }
 
@@ -267,45 +305,24 @@ function toStreamItem(embed, show, s, e, lang) {
 async function streamsForSlug(slug, title, s, e, absolute) {
   var html = await httpGet(ANIMEAV1 + "/media/" + slug + "/" + absolute);
   var embeds = parseEmbeds(html);
-  var isDirectHost = function (url) {
-    return url.indexOf("mp4upload.com") !== -1 || url.indexOf("yourupload.com") !== -1;
-  };
   var serverRank = function (url) { return url.indexOf("mp4upload.com") !== -1 ? 0 : 1; };
-  // Directos primero (pares DUB+SUB por servidor, MP4Upload antes),
-  // fallbacks embed despues como ultimo recurso.
-  var directs = [];
-  var fallbacks = [];
+  // getStreams devuelve EMBEDS (listado rapido). La resolucion a video
+  // directo ocurre en extract() al dar play, con URL fresca: los tokens
+  // caducan en minutos y resolver aqui dejaba enlaces muertos.
+  var out = [];
   ["DUB", "SUB"].forEach(function (lang) {
-    embeds[lang].forEach(function (x) {
-      (isDirectHost(x.url) ? directs : fallbacks).push({ embed: x, lang: lang });
-    });
+    var sorted = embeds[lang].slice().sort(function (a, b) { return serverRank(a.url) - serverRank(b.url); });
+    sorted.forEach(function (x) { out.push(toStreamItem(x, title, s, e, lang)); });
   });
-  directs.sort(function (a, b) {
-    var r = serverRank(a.embed.url) - serverRank(b.embed.url);
-    if (r !== 0) return r;
-    if (a.lang === b.lang) return 0;
-    return a.lang === "DUB" ? -1 : 1;
+  // MP4Upload primero (pares DUB+SUB), luego el resto.
+  out.sort(function (a, b) {
+    var ra = a.url.indexOf("mp4upload.com") !== -1 ? 0 : 1;
+    var rb = b.url.indexOf("mp4upload.com") !== -1 ? 0 : 1;
+    if (ra !== rb) return ra - rb;
+    var la = a.title.indexOf("[DUB]") !== -1 ? 0 : 1;
+    var lb = b.title.indexOf("[DUB]") !== -1 ? 0 : 1;
+    return la - lb;
   });
-  var items = [];
-  await Promise.all(directs.map(function (o, idx) {
-    return extract(o.embed.url).then(function (r) {
-      if (r.url && r.url !== o.embed.url) {
-        items.push({
-          idx: idx,
-          url: r.url,
-          title: title + " " + epLabel(s, e) + " [" + o.lang + "] " + o.embed.server,
-          quality: "HD",
-          provider: "AnimeAV1",
-          headers: r.headers || { Referer: o.embed.url, "User-Agent": UA }
-        });
-      }
-    }).catch(function () { /* servidor descartado */ });
-  }));
-  items.sort(function (x, y) { return x.idx - y.idx; });
-  var out = items.map(function (x) {
-    return { url: x.url, title: x.title, quality: x.quality, provider: x.provider, headers: x.headers };
-  });
-  fallbacks.forEach(function (o) { out.push(toStreamItem(o.embed, title, s, e, o.lang)); });
   return out;
 }
 

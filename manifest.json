@@ -1,8 +1,8 @@
 {
   "id": "animeav1-naruto-dub",
   "name": "AnimeAV1",
-  "version": "1.1.2",
-  "description": "Fuente general AnimeAV1: directos verificados mas fallbacks por anime",
+  "version": "1.2.0",
+  "description": "Fuente general AnimeAV1: resolucion fresca al reproducir con reintento",
   "type": "source",
   "author": "local",
   "logo": "https://cdn.animeav1.com/covers/190.jpg",
