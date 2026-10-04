@@ -1,12 +1,16 @@
 /**
  * AnimeAV1 - CC — addon general tipo "source" (LolPlusTV SDK API v1).
  * Flujo general para cualquier anime (series):
- *   TMDB id -> titulos (TMDB web es/en, sin API key)
+ *   TMDB id -> titulos (Wikidata P4983 es/en, sin key; fallback TMDB web/API)
  *   -> candidatos (buscador animeav1) -> confirmacion (aka/titulo de /media/{slug})
  *   -> slug + episodio absoluto -> embeds DUB/SUB.
  *   getStreams devuelve embeds (listado rapido); extract() resuelve a video
  *   directo fresco al dar play, con verificacion y un reintento, porque los
  *   tokens caducan por peticion y los hosts a veces fallan.
+ *
+ * Nota: TMDB web bloquea scrapers con 403 (fail-fast, sin reintentar el
+ * baneo). Para ese caso se usa el proxy lector r.jina.ai como transporte
+ * alternativo. Los 403/429 nunca se reintentan en directo.
  *
  * Limitaciones conocidas:
  * - Peliculas (type "movie"): no resueltas, retorna [].
@@ -18,6 +22,7 @@ var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, l
 var ANIMEAV1 = "https://animeav1.com";
 var TMDB = "https://www.themoviedb.org";
 var FETCH_TIMEOUT = 10000;
+var JINA = "https://r.jina.ai/";
 var mediaCache = {};
 var titleCache = {};
 var searchCache = {};
@@ -26,36 +31,46 @@ function sleepMs(ms) {
   return new Promise(function (res) { setTimeout(res, ms); });
 }
 
-/** GET con reintentos ante rate-limit (TMDB responde 403/429 si hay muchas peticiones). */
-async function httpGet(url, headers) {
+/** GET rapido: 1 reintento solo ante fallos de red/timeout. Los HTTP fallan directo. */
+async function httpGet(url, headers, timeoutMs) {
   var lastErr = null;
-  for (var attempt = 0; attempt < 3; attempt++) {
+  for (var attempt = 0; attempt < 2; attempt++) {
     var ctrl = null;
     var timer = null;
     try {
       if (typeof AbortController !== "undefined") {
         ctrl = new AbortController();
-        timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, FETCH_TIMEOUT);
+        timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, timeoutMs || FETCH_TIMEOUT);
       }
       var opts = { headers: headers || {} };
       if (!opts.headers["User-Agent"]) opts.headers["User-Agent"] = UA;
       if (ctrl) opts.signal = ctrl.signal;
       var r = await fetch(url, opts);
       if (timer) clearTimeout(timer);
-      if (r.status === 403 || r.status === 429) {
-        lastErr = new Error("HTTP " + r.status + " en " + url);
-        await sleepMs(2000 * (attempt + 1));
-        continue;
-      }
       if (!r.ok) throw new Error("HTTP " + r.status + " en " + url);
       return await r.text();
     } catch (err) {
       if (timer) clearTimeout(timer);
       lastErr = err;
-      if (attempt < 2) await sleepMs(1500 * (attempt + 1));
+      var isHttp = err && /^HTTP \d+/.test(err.message || "");
+      if (isHttp || attempt >= 1) throw err;
+      await sleepMs(1200);
     }
   }
   throw lastErr;
+}
+
+/** Pagina web: directo, y solo ante 403 se reintenta via proxy lector. */
+async function fetchPage(url, headers) {
+  try {
+    return await httpGet(url, headers);
+  } catch (err) {
+    var msg = String((err && err.message) || err);
+    if (msg.indexOf("HTTP 403") !== -1) {
+      return await httpGet(JINA + url, headers, 25000);
+    }
+    throw err;
+  }
 }
 
 function decodeEntities(s) {
@@ -82,24 +97,48 @@ function overlap(a, b) {
   return hits / a.length;
 }
 
-/** Titulos TMDB es + en (en paralelo, con cache). */
+/** Titulos es+en via Wikidata (P4983 = TMDB TV series ID). Sin key, con cache. */
+async function wikidataTitles(id) {
+  var ck = "wd:" + id;
+  if (titleCache[ck]) return titleCache[ck];
+  var q = 'SELECT ?en ?es WHERE { ?item wdt:P4983 "' + id + '".'
+    + ' OPTIONAL { ?item rdfs:label ?en. FILTER(LANG(?en) = "en") }'
+    + ' OPTIONAL { ?item rdfs:label ?es. FILTER(LANG(?es) = "es") } } LIMIT 1';
+  var j = JSON.parse(await httpGet(
+    "https://query.wikidata.org/sparql?query=" + encodeURIComponent(q) + "&format=json",
+    { Accept: "application/sparql-results+json" }
+  ));
+  var b = (j.results && j.results.bindings && j.results.bindings[0]) || {};
+  var out = [];
+  ["es", "en"].forEach(function (lang) {
+    if (b[lang] && b[lang].value) {
+      var t = cleanTitle(b[lang].value);
+      if (t && out.indexOf(t) === -1) out.push(t);
+    }
+  });
+  titleCache[ck] = out;
+  return out;
+}
+
+/** Titulos TMDB web es + en (fallback; usa proxy si hay 403). */
 async function tmdbTitles(id) {
-  if (titleCache[id]) return titleCache[id];
+  var ck = "tmdb:" + id;
+  if (titleCache[ck]) return titleCache[ck];
   function titleOf(html) {
     var m = html.match(/<meta property="og:title" content="([^"]+)"/);
     return m ? cleanTitle(m[1]) : "";
   }
   var results = await Promise.all([
-    httpGet(TMDB + "/tv/" + id + "?language=es").catch(function () { return ""; }),
-    httpGet(TMDB + "/tv/" + id + "?language=en-US").catch(function () { return ""; })
+    fetchPage(TMDB + "/tv/" + id + "?language=es").catch(function () { return ""; }),
+    fetchPage(TMDB + "/tv/" + id + "?language=en-US").catch(function () { return ""; })
   ]);
   var out = [];
   results.forEach(function (html) {
     var t = titleOf(html);
     if (t && out.indexOf(t) === -1) out.push(t);
   });
-  titleCache[id] = out.filter(function (t) { return !!t; });
-  return titleCache[id];
+  titleCache[ck] = out.filter(function (t) { return !!t; });
+  return titleCache[ck];
 }
 
 /** Slugs candidatos del buscador animeav1 (ordenados, unicos, con cache). */
@@ -179,7 +218,7 @@ async function pickSlug(variants, season) {
       if (cands.indexOf(s) === -1) cands.push(s);
     });
   });
-  cands = cands.slice(0, 10);
+  cands = cands.slice(0, 6);
   var checked = await Promise.all(cands.map(function (c) {
     return mediaInfo(c).then(function (info) {
       return { slug: c, info: info, score: confirmScore(c, info, variants) };
@@ -211,7 +250,7 @@ async function pickSlug(variants, season) {
 /** Offset de temporada TMDB (suma de episodios previos). -1 si no calculable. */
 async function seasonOffset(tmdbId, season) {
   if (!season || season <= 1) return 0;
-  var html = await httpGet(TMDB + "/tv/" + tmdbId + "/seasons?language=es");
+  var html = await fetchPage(TMDB + "/tv/" + tmdbId + "/seasons?language=es");
   var bySeason = {};
   var re = /\/tv\/\d+\/season\/(\d+)[\s\S]{0,1200}?(\d+)\s*episodios/gi;
   var m;
@@ -368,7 +407,11 @@ async function getStreams(tmdbId, type, season, episode) {
     var digits = String(tmdbId || "").match(/\d+/);
     if (!digits) return [];
 
-    var variants = await tmdbTitles(digits[0]).catch(function () { return []; });
+    // Titulos: Wikidata (sin key) -> TMDB web (fallback) -> texto directo.
+    var variants = await wikidataTitles(digits[0]).catch(function () { return []; });
+    if (!variants.length) {
+      variants = await tmdbTitles(digits[0]).catch(function () { return []; });
+    }
     if (!variants.length) {
       if (/naruto/i.test(String(tmdbId))) variants = ["Naruto"];
       else return [];

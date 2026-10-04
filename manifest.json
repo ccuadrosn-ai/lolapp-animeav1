@@ -1,8 +1,8 @@
 {
   "id": "animeav1-naruto-dub",
   "name": "AnimeAV1 - CC",
-  "version": "1.2.2",
-  "description": "Fuente general AnimeAV1: temporadas por titulo ES/EN/CN y retry anti rate-limit",
+  "version": "1.3.0",
+  "description": "Fuente general AnimeAV1: titulos via Wikidata, sin depender de TMDB web",
   "type": "source",
   "author": "local",
   "logo": "https://cdn.animeav1.com/covers/190.jpg",
