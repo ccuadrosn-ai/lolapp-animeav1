@@ -89,11 +89,89 @@ async function extract(embedUrl) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Catálogo mínimo (mismo repo): solo expone Naruto para que la app lo liste.
+// La app registra el addon según el apartado desde donde se instala
+// (Fuentes vs Catálogos), así que instala esta misma URI en ambas secciones.
+// ---------------------------------------------------------------------------
+
+var NARUTO_ITEM = {
+  id: "animeav1:naruto",
+  title: "Naruto",
+  originalTitle: "ナルト",
+  type: "tv",
+  poster: "https://cdn.animeav1.com/covers/190.jpg",
+  backdrop: "https://cdn.animeav1.com/backdrops/190.jpg",
+  overview: "Naruto Uzumaki, un ninja hiperactivo de Konohagakure, lucha por ser reconocido y convertirse en Hokage.",
+  year: "2002",
+  rating: 8.02,
+  genres: ["Acción", "Aventura", "Fantasía", "Shounen", "Artes Marciales"]
+};
+
+async function getHome() {
+  try {
+    return {
+      rows: [
+        {
+          id: "solo_naruto",
+          title: "Solo Naruto",
+          items: [NARUTO_ITEM]
+        }
+      ]
+    };
+  } catch (err) {
+    return { rows: [] };
+  }
+}
+
+async function search(args) {
+  try {
+    var q = "";
+    if (args) q = args.query || args.q || "";
+    if (String(q).toLowerCase().indexOf("naruto") !== -1) {
+      return [NARUTO_ITEM];
+    }
+    return [];
+  } catch (err) {
+    return [];
+  }
+}
+
+async function discover(args) {
+  try {
+    return [NARUTO_ITEM];
+  } catch (err) {
+    return [];
+  }
+}
+
+async function getMeta(args) {
+  try {
+    return {
+      id: (args && args.id) || NARUTO_ITEM.id,
+      title: NARUTO_ITEM.title,
+      overview: NARUTO_ITEM.overview,
+      poster: NARUTO_ITEM.poster,
+      backdrop: NARUTO_ITEM.backdrop,
+      year: NARUTO_ITEM.year,
+      rating: NARUTO_ITEM.rating,
+      genres: NARUTO_ITEM.genres,
+      cast: ["Junko Takeuchi", "Chie Nakamura", "Kazuhiko Inoue"]
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
 // Registro CJS (documentación) + globales (runtimes sandbox).
 if (typeof globalThis !== "undefined") {
   globalThis.getStreams = getStreams;
   globalThis.extract = extract;
+  globalThis.getHome = getHome;
+  globalThis.search = search;
+  globalThis.discover = discover;
+  globalThis.getMeta = getMeta;
 }
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { getStreams, extract };
+  module.exports = { getStreams, extract, getHome, search, discover, getMeta };
 }
