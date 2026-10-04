@@ -1,8 +1,8 @@
 {
   "id": "animeav1-naruto-dub",
   "name": "AnimeAV1 Naruto DUB",
-  "version": "1.1.0",
-  "description": "Proveedor general AnimeAV1: TMDB a slug mas video directo DUB/SUB",
+  "version": "1.1.1",
+  "description": "Proveedor general AnimeAV1: solo video directo verificado (MP4Upload/YourUpload)",
   "type": "source",
   "author": "local",
   "logo": "https://cdn.animeav1.com/covers/190.jpg",

@@ -15,8 +15,10 @@
 var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36";
 var ANIMEAV1 = "https://animeav1.com";
 var TMDB = "https://www.themoviedb.org";
-var FETCH_TIMEOUT = 15000;
+var FETCH_TIMEOUT = 10000;
 var mediaCache = {};
+var titleCache = {};
+var searchCache = {};
 
 function httpGet(url, headers) {
   var ctrl = null;
@@ -64,23 +66,29 @@ function overlap(a, b) {
   return hits / a.length;
 }
 
-/** Titulos TMDB es + en. */
+/** Titulos TMDB es + en (en paralelo, con cache). */
 async function tmdbTitles(id) {
-  var out = [];
-  var es = await httpGet(TMDB + "/tv/" + id + "?language=es").catch(function () { return ""; });
-  var m = es.match(/<meta property="og:title" content="([^"]+)"/);
-  if (m) out.push(cleanTitle(m[1]));
-  var en = await httpGet(TMDB + "/tv/" + id + "?language=en-US").catch(function () { return ""; });
-  var m2 = en.match(/<meta property="og:title" content="([^"]+)"/);
-  if (m2) {
-    var t = cleanTitle(m2[1]);
-    if (out.indexOf(t) === -1) out.push(t);
+  if (titleCache[id]) return titleCache[id];
+  function titleOf(html) {
+    var m = html.match(/<meta property="og:title" content="([^"]+)"/);
+    return m ? cleanTitle(m[1]) : "";
   }
-  return out.filter(function (t) { return !!t; });
+  var results = await Promise.all([
+    httpGet(TMDB + "/tv/" + id + "?language=es").catch(function () { return ""; }),
+    httpGet(TMDB + "/tv/" + id + "?language=en-US").catch(function () { return ""; })
+  ]);
+  var out = [];
+  results.forEach(function (html) {
+    var t = titleOf(html);
+    if (t && out.indexOf(t) === -1) out.push(t);
+  });
+  titleCache[id] = out.filter(function (t) { return !!t; });
+  return titleCache[id];
 }
 
-/** Slugs candidatos del buscador animeav1 (ordenados, unicos). */
+/** Slugs candidatos del buscador animeav1 (ordenados, unicos, con cache). */
 async function searchSlugs(query) {
+  if (searchCache[query]) return searchCache[query];
   var html = await httpGet(ANIMEAV1 + "/catalogo?search=" + encodeURIComponent(query));
   var seen = {};
   var slugs = [];
@@ -89,6 +97,7 @@ async function searchSlugs(query) {
   while ((m = re.exec(html)) !== null) {
     if (!seen[m[1]] && m[1].split("/").length === 3) { seen[m[1]] = 1; slugs.push(m[1].split("/")[2]); }
   }
+  searchCache[query] = slugs;
   return slugs;
 }
 
@@ -133,24 +142,24 @@ function slugSeason(slug) {
   return m ? parseInt(m[1], 10) : 1;
 }
 
-/** Elige slug: confirma candidatos y prefiere base (S1) o slug de temporada. */
+/** Elige slug: confirma candidatos en paralelo y prefiere base (S1) o slug de temporada. */
 async function pickSlug(variants, season) {
+  var lists = await Promise.all(variants.map(function (v) {
+    return searchSlugs(v).catch(function () { return []; });
+  }));
   var cands = [];
-  for (var i = 0; i < variants.length; i++) {
-    var slugs = await searchSlugs(variants[i]).catch(function () { return []; });
+  lists.forEach(function (slugs) {
     slugs.slice(0, 10).forEach(function (s) {
       if (cands.indexOf(s) === -1) cands.push(s);
     });
-    if (cands.length >= 10) break;
-  }
-  var scored = [];
-  for (var j = 0; j < Math.min(cands.length, 8); j++) {
-    try {
-      var info = await mediaInfo(cands[j]);
-      var score = confirmScore(cands[j], info, variants);
-      if (score >= 0.5) scored.push({ slug: cands[j], info: info, score: score });
-    } catch (e) { /* candidato inaccesible */ }
-  }
+  });
+  cands = cands.slice(0, 10);
+  var checked = await Promise.all(cands.map(function (c) {
+    return mediaInfo(c).then(function (info) {
+      return { slug: c, info: info, score: confirmScore(c, info, variants) };
+    }).catch(function () { return null; });
+  }));
+  var scored = checked.filter(function (c) { return c && c.score >= 0.5; });
   if (!scored.length) return null;
   if (season <= 1) {
     scored.sort(function (a, b) {
@@ -276,42 +285,52 @@ function toStreamItem(embed, show, s, e, lang) {
 async function streamsForSlug(slug, title, s, e, absolute) {
   var html = await httpGet(ANIMEAV1 + "/media/" + slug + "/" + absolute);
   var embeds = parseEmbeds(html);
+  var serverRank = function (url) {
+    if (url.indexOf("mp4upload.com") !== -1) return 0;
+    if (url.indexOf("yourupload.com") !== -1) return 1;
+    return 2;
+  };
+  var byServer = function (a, b) { return serverRank(a.url) - serverRank(b.url); };
   var ordered = [];
-  embeds.DUB.forEach(function (x) { ordered.push({ embed: x, lang: "DUB" }); });
-  embeds.SUB.forEach(function (x) { ordered.push({ embed: x, lang: "SUB" }); });
+  var pushLang = function (list, lang) {
+    list.slice().sort(byServer).forEach(function (x) { ordered.push({ embed: x, lang: lang }); });
+  };
+  // MP4Upload primero (es el que la app reproduce): pares DUB+SUB por servidor.
+  var dubMp4 = embeds.DUB.filter(function (x) { return x.url.indexOf("mp4upload.com") !== -1; });
+  var subMp4 = embeds.SUB.filter(function (x) { return x.url.indexOf("mp4upload.com") !== -1; });
+  var dubRest = embeds.DUB.filter(function (x) { return x.url.indexOf("mp4upload.com") === -1; });
+  var subRest = embeds.SUB.filter(function (x) { return x.url.indexOf("mp4upload.com") === -1; });
+  pushLang(dubMp4, "DUB"); pushLang(subMp4, "SUB");
+  pushLang(dubRest, "DUB"); pushLang(subRest, "SUB");
   if (!ordered.length) return [];
+  // Solo se publican servidores con video directo verificado. Los embeds
+  // (Voe/UPNShare/StreamTape sin resolver) se descartan: la app los valida,
+  // tardan y nunca reproducen en el player nativo.
   var items = [];
-  var jobs = ordered.map(function (o) {
+  var jobs = ordered.map(function (o, idx) {
     var host = o.embed.url;
     var resolvable = host.indexOf("mp4upload.com") !== -1
       || host.indexOf("yourupload.com") !== -1
       || host.indexOf("streamtape.") !== -1;
-    if (!resolvable) {
-      items.push({ item: toStreamItem(o.embed, title, s, e, o.lang), priority: 2 });
-      return Promise.resolve();
-    }
+    if (!resolvable) return Promise.resolve();
     return extract(o.embed.url).then(function (r) {
       if (r.url !== o.embed.url) {
         items.push({
-          item: {
-            url: r.url,
-            title: title + " " + epLabel(s, e) + " [" + o.lang + "] " + o.embed.server,
-            quality: "HD",
-            provider: "AnimeAV1",
-            headers: r.headers || { Referer: o.embed.url, "User-Agent": UA }
-          },
-          priority: 1
+          idx: idx,
+          url: r.url,
+          title: title + " " + epLabel(s, e) + " [" + o.lang + "] " + o.embed.server,
+          quality: "HD",
+          provider: "AnimeAV1",
+          headers: r.headers || { Referer: o.embed.url, "User-Agent": UA }
         });
-      } else {
-        items.push({ item: toStreamItem(o.embed, title, s, e, o.lang), priority: 2 });
       }
-    }).catch(function () {
-      items.push({ item: toStreamItem(o.embed, title, s, e, o.lang), priority: 2 });
-    });
+    }).catch(function () { /* servidor descartado */ });
   });
   await Promise.all(jobs);
-  items.sort(function (x, y) { return x.priority - y.priority; });
-  return items.map(function (x) { return x.item; });
+  items.sort(function (x, y) { return x.idx - y.idx; });
+  return items.map(function (x) {
+    return { url: x.url, title: x.title, quality: x.quality, provider: x.provider, headers: x.headers };
+  });
 }
 
 /** getStreams(): pipeline general TMDB -> animeav1 -> embeds. */
