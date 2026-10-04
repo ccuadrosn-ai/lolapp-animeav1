@@ -1,0 +1,14 @@
+{
+  "id": "animeav1-naruto-dub",
+  "name": "AnimeAV1 Naruto DUB",
+  "version": "1.0.0",
+  "description": "Proveedor DUB mínimo - Naruto Ep.1",
+  "type": "source",
+  "author": "local",
+  "logo": "https://cdn.animeav1.com/covers/190.jpg",
+  "entry": "index.js",
+  "supportedTypes": ["tv"],
+  "capabilities": ["resolve"],
+  "mode": "vod",
+  "apiVersion": 1
+}
