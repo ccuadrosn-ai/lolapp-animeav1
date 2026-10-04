@@ -1,6 +1,5 @@
 /**
  * AnimeAV1 — addon general tipo "source" (LolPlusTV SDK API v1).
- *
  * Flujo general para cualquier anime (series):
  *   TMDB id -> titulos (TMDB web es/en, sin API key)
  *   -> candidatos (buscador animeav1) -> confirmacion (aka/titulo de /media/{slug})
@@ -233,32 +232,15 @@ async function resolveYourUpload(embedUrl) {
   return m[1];
 }
 
-async function resolveStreamTape(embedUrl) {
-  var view = embedUrl.replace(/\/e\//, "/v/");
-  var html = await httpGet(view, { Referer: ANIMEAV1 + "/" });
-  var m = html.match(/id="robotlink"[^>]*>([^<]+)</);
-  if (!m) throw new Error("StreamTape sin robotlink");
-  var gate = "https://streamtape.com" + m[1].replace(/^\/streamtape\.com/, "");
-  var r = await fetch(gate, {
-    headers: { "User-Agent": UA, Referer: view },
-    redirect: "manual"
-  });
-  var loc = r.headers.get("location") || "";
-  if (r.status >= 300 && r.status < 400 && loc) {
-    if (loc.indexOf("http") !== 0) loc = "https:" + loc;
-    return loc;
-  }
-  throw new Error("StreamTape gate " + r.status);
-}
-
-/** extract(): embed -> video directo (falla -> embed original). */
+/** extract(): embed -> video directo (falla -> embed original).
+ * StreamTape/Voe/UPNShare se devuelven tal cual: el gate de StreamTape
+ * responde 500 sistematico y los otros exigen JS de navegador. */
 async function extract(embedUrl) {
   try {
     var u = String(embedUrl && embedUrl.url ? embedUrl.url : embedUrl);
     var direct = null;
     if (u.indexOf("mp4upload.com") !== -1) direct = await resolveMp4Upload(u);
     else if (u.indexOf("yourupload.com") !== -1) direct = await resolveYourUpload(u);
-    else if (u.indexOf("streamtape.") !== -1) direct = await resolveStreamTape(u);
     if (direct) {
       return { url: direct, quality: "HD", headers: { Referer: u, "User-Agent": UA } };
     }
@@ -285,36 +267,29 @@ function toStreamItem(embed, show, s, e, lang) {
 async function streamsForSlug(slug, title, s, e, absolute) {
   var html = await httpGet(ANIMEAV1 + "/media/" + slug + "/" + absolute);
   var embeds = parseEmbeds(html);
-  var serverRank = function (url) {
-    if (url.indexOf("mp4upload.com") !== -1) return 0;
-    if (url.indexOf("yourupload.com") !== -1) return 1;
-    return 2;
+  var isDirectHost = function (url) {
+    return url.indexOf("mp4upload.com") !== -1 || url.indexOf("yourupload.com") !== -1;
   };
-  var byServer = function (a, b) { return serverRank(a.url) - serverRank(b.url); };
-  var ordered = [];
-  var pushLang = function (list, lang) {
-    list.slice().sort(byServer).forEach(function (x) { ordered.push({ embed: x, lang: lang }); });
-  };
-  // MP4Upload primero (es el que la app reproduce): pares DUB+SUB por servidor.
-  var dubMp4 = embeds.DUB.filter(function (x) { return x.url.indexOf("mp4upload.com") !== -1; });
-  var subMp4 = embeds.SUB.filter(function (x) { return x.url.indexOf("mp4upload.com") !== -1; });
-  var dubRest = embeds.DUB.filter(function (x) { return x.url.indexOf("mp4upload.com") === -1; });
-  var subRest = embeds.SUB.filter(function (x) { return x.url.indexOf("mp4upload.com") === -1; });
-  pushLang(dubMp4, "DUB"); pushLang(subMp4, "SUB");
-  pushLang(dubRest, "DUB"); pushLang(subRest, "SUB");
-  if (!ordered.length) return [];
-  // Solo se publican servidores con video directo verificado. Los embeds
-  // (Voe/UPNShare/StreamTape sin resolver) se descartan: la app los valida,
-  // tardan y nunca reproducen en el player nativo.
+  var serverRank = function (url) { return url.indexOf("mp4upload.com") !== -1 ? 0 : 1; };
+  // Directos primero (pares DUB+SUB por servidor, MP4Upload antes),
+  // fallbacks embed despues como ultimo recurso.
+  var directs = [];
+  var fallbacks = [];
+  ["DUB", "SUB"].forEach(function (lang) {
+    embeds[lang].forEach(function (x) {
+      (isDirectHost(x.url) ? directs : fallbacks).push({ embed: x, lang: lang });
+    });
+  });
+  directs.sort(function (a, b) {
+    var r = serverRank(a.embed.url) - serverRank(b.embed.url);
+    if (r !== 0) return r;
+    if (a.lang === b.lang) return 0;
+    return a.lang === "DUB" ? -1 : 1;
+  });
   var items = [];
-  var jobs = ordered.map(function (o, idx) {
-    var host = o.embed.url;
-    var resolvable = host.indexOf("mp4upload.com") !== -1
-      || host.indexOf("yourupload.com") !== -1
-      || host.indexOf("streamtape.") !== -1;
-    if (!resolvable) return Promise.resolve();
+  await Promise.all(directs.map(function (o, idx) {
     return extract(o.embed.url).then(function (r) {
-      if (r.url !== o.embed.url) {
+      if (r.url && r.url !== o.embed.url) {
         items.push({
           idx: idx,
           url: r.url,
@@ -325,12 +300,13 @@ async function streamsForSlug(slug, title, s, e, absolute) {
         });
       }
     }).catch(function () { /* servidor descartado */ });
-  });
-  await Promise.all(jobs);
+  }));
   items.sort(function (x, y) { return x.idx - y.idx; });
-  return items.map(function (x) {
+  var out = items.map(function (x) {
     return { url: x.url, title: x.title, quality: x.quality, provider: x.provider, headers: x.headers };
   });
+  fallbacks.forEach(function (o) { out.push(toStreamItem(o.embed, title, s, e, o.lang)); });
+  return out;
 }
 
 /** getStreams(): pipeline general TMDB -> animeav1 -> embeds. */
