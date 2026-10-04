@@ -22,26 +22,40 @@ var mediaCache = {};
 var titleCache = {};
 var searchCache = {};
 
-function httpGet(url, headers) {
-  var ctrl = null;
-  var timer = null;
-  try {
-    if (typeof AbortController !== "undefined") {
-      ctrl = new AbortController();
-      timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, FETCH_TIMEOUT);
+function sleepMs(ms) {
+  return new Promise(function (res) { setTimeout(res, ms); });
+}
+
+/** GET con reintentos ante rate-limit (TMDB responde 403/429 si hay muchas peticiones). */
+async function httpGet(url, headers) {
+  var lastErr = null;
+  for (var attempt = 0; attempt < 3; attempt++) {
+    var ctrl = null;
+    var timer = null;
+    try {
+      if (typeof AbortController !== "undefined") {
+        ctrl = new AbortController();
+        timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, FETCH_TIMEOUT);
+      }
+      var opts = { headers: headers || {} };
+      if (!opts.headers["User-Agent"]) opts.headers["User-Agent"] = UA;
+      if (ctrl) opts.signal = ctrl.signal;
+      var r = await fetch(url, opts);
+      if (timer) clearTimeout(timer);
+      if (r.status === 403 || r.status === 429) {
+        lastErr = new Error("HTTP " + r.status + " en " + url);
+        await sleepMs(2000 * (attempt + 1));
+        continue;
+      }
+      if (!r.ok) throw new Error("HTTP " + r.status + " en " + url);
+      return await r.text();
+    } catch (err) {
+      if (timer) clearTimeout(timer);
+      lastErr = err;
+      if (attempt < 2) await sleepMs(1500 * (attempt + 1));
     }
-  } catch (e) { ctrl = null; }
-  var opts = { headers: headers || {} };
-  if (!opts.headers["User-Agent"]) opts.headers["User-Agent"] = UA;
-  if (ctrl) opts.signal = ctrl.signal;
-  return fetch(url, opts).then(function (r) {
-    if (timer) clearTimeout(timer);
-    if (!r.ok) throw new Error("HTTP " + r.status + " en " + url);
-    return r.text();
-  }, function (err) {
-    if (timer) clearTimeout(timer);
-    throw err;
-  });
+  }
+  throw lastErr;
 }
 
 function decodeEntities(s) {
@@ -140,7 +154,17 @@ function confirmScore(slug, info, variants) {
 }
 
 function slugSeason(slug) {
-  var m = slug.match(/-season-(\d+)/) || slug.match(/-(\d+)(?:nd|rd|th)-season/) || slug.match(/-part-(\d+)$/);
+  var m = slug.match(/-season-(\d+)/) || slug.match(/-(\d+)(?:nd|rd|th)-season/)
+    || slug.match(/-part-(\d+)$/) || slug.match(/-temporada-(\d+)/);
+  return m ? parseInt(m[1], 10) : 1;
+}
+
+/** Temporada segun el TITULO ("Temporada 2", "Season 2", "2nd Season", "Part 2", "第2期"). */
+function titleSeason(t) {
+  var s = String(t || "");
+  var m = s.match(/temporada\s*(\d+)/i) || s.match(/season\s*(\d+)/i)
+    || s.match(/(\d+)(?:nd|rd|th)\s*season/i) || s.match(/\bpart\s*(\d+)/i)
+    || s.match(/第(\d+)期/);
   return m ? parseInt(m[1], 10) : 1;
 }
 
@@ -173,7 +197,9 @@ async function pickSlug(variants, season) {
     });
     return scored[0];
   }
-  var dated = scored.filter(function (c) { return slugSeason(c.slug) === season; });
+  var dated = scored.filter(function (c) {
+    return slugSeason(c.slug) === season || titleSeason(c.info.title) === season;
+  });
   if (dated.length) {
     dated.sort(function (a, b) { return b.score - a.score; });
     return dated[0];
@@ -352,7 +378,9 @@ async function getStreams(tmdbId, type, season, episode) {
 
     var absolute = e;
     var slug = picked.slug;
-    if (s > 1 && slugSeason(slug) === 1) {
+    // Solo se suma offset si el slug elegido es la serie base (temporada 1
+    // segun slug Y titulo). Si ya es slug de temporada, el episodio es directo.
+    if (s > 1 && slugSeason(slug) === 1 && titleSeason(picked.info.title) === 1) {
       try {
         var off = await seasonOffset(digits[0], s);
         absolute = off >= 0 ? off + e : e;
